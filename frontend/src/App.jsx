@@ -46,52 +46,83 @@ export default function App() {
     setLoading(true)
 
     try {
-      // Prepare conversation history (last 10 messages)
-      const conversationHistory = messages.slice(-9).map(msg => ({
+      // Prepare conversation history (REDUCED to last 5 messages for speed)
+      const conversationHistory = messages.slice(-5).map(msg => ({
         role: msg.role,
         content: msg.content
       }))
 
-      // Send request to backend
-      const response = await axios.post(`${BACKEND_URL}/chat`, {
-        message: message,
-        language: language,
-        conversation_history: conversationHistory
+      // Use streaming endpoint for real-time response
+      const response = await fetch(`${BACKEND_URL}/chat/stream`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          message: message,
+          language: language,
+          conversation_history: conversationHistory
+        })
       })
 
-      // Add bot response
-      const botMessage = {
-        role: 'assistant',
-        content: response.data.reply
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`)
       }
 
-      setMessages(prev => {
-        const updated = [...prev, botMessage]
-        // Keep only last 10 messages
-        return updated.slice(-10)
-      })
+      // Create an empty bot message and stream tokens into it
+      let botContent = ''
+      setMessages(prev => [...prev, { role: 'assistant', content: '' }])
+
+      // Read the streaming response
+      const reader = response.body.getReader()
+      const decoder = new TextDecoder()
+
+      try {
+        while (true) {
+          const { done, value } = await reader.read()
+          if (done) break
+
+          const chunk = decoder.decode(value)
+          const lines = chunk.split('\n')
+
+          for (const line of lines) {
+            if (line.startsWith('data: ')) {
+              try {
+                const data = JSON.parse(line.slice(6))
+                
+                if (data.token) {
+                  // Stream token into the bot message
+                  botContent += data.token
+                  setMessages(prev => {
+                    const updated = [...prev]
+                    updated[updated.length - 1].content = botContent
+                    return updated
+                  })
+                } else if (data.error) {
+                  setError(`Error: ${data.error}`)
+                }
+              } catch (e) {
+                // Skip invalid JSON
+              }
+            }
+          }
+        }
+      } finally {
+        reader.releaseLock()
+      }
+
+      // Keep only last 10 messages
+      setMessages(prev => prev.slice(-10))
     } catch (err) {
       console.error('Error sending message:', err)
       
       if (!apiConnected) {
         setError('Backend connection failed. Please ensure the FastAPI server is running on http://localhost:8000')
-      } else if (err.response?.status === 429) {
-        setError('⚠️ API Rate Limited: You\'ve exceeded your OpenAI quota. Please check your plan and billing at https://platform.openai.com/account/billing/overview')
-      } else if (err.response?.status === 400) {
-        setError(`Invalid request: ${err.response.data?.detail || 'Please try again.'}`)
-      } else if (err.response?.status === 401) {
-        setError('❌ Authentication Error: Invalid OpenAI API key. Please check your .env file.')
-      } else if (err.response?.status === 500) {
-        const errorDetail = err.response.data?.detail || 'Unknown error'
-        // Extract OpenAI error message
-        if (errorDetail.includes('quota')) {
-          setError('❌ OpenAI Quota Exceeded: You\'ve reached your API usage limit. Visit https://platform.openai.com/account/billing/overview to upgrade.')
-        } else if (errorDetail.includes('Unauthorized')) {
-          setError('❌ OpenAI Authentication Failed: Invalid or missing API key. Check your .env file.')
-        } else {
-          setError(`Server error: ${errorDetail}`)
-        }
-      } else if (err.code === 'ERR_NETWORK') {
+      } else if (err.message.includes('401')) {
+        setError('❌ Authentication Error: Invalid Ollama configuration.')
+      } else if (err.message.includes('500')) {
+        setError(`Server error: ${err.message}`)
+      } else if (err.message.includes('ERR_NETWORK') || err.name === 'TypeError') {
         setError('Network error. Please check your connection and ensure the backend server is running.')
       } else {
         setError(`Error: ${err.message}`)
